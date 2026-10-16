@@ -30,7 +30,9 @@ class Tracker:
         f = s.done / s.total if s.total else 0.0
         if s.mode == "transcribe" or s.mode == "translate":
             return 100.0 * f
-        return 50.0 * f if s.stage == "转写" else 50.0 + 50.0 * f
+        if s.stage == "转写": return 50.0 * f
+        if s.stage == "翻译": return 50.0 + 50.0 * f
+        return 0.0
 
     def eta(s):
         if not s.times or s.total <= s.done:
