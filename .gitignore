@@ -1,0 +1,14 @@
+keys.env
+*.bak*
+.venv/
+__pycache__/
+*.log
+test/
+*.srt
+*.mp4
+*.mkv
+*.aiff
+*.wav
+trans_*/
+*_work/
+.DS_Store
