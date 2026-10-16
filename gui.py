@@ -16,7 +16,7 @@ class Tracker:
     def __init__(s, mode="all"):
         s.mode = mode; s.t0 = time.time(); s.state = "运行中"
         s.fi = s.nf = 0; s.stage = ""; s.done = s.total = 0
-        s.last = time.time(); s.times = []
+        s.last = time.time(); s.times = []; s.t_end = None
 
     def update(s, fi, nf, stage, done, total, cached):
         now = time.time()
@@ -45,7 +45,7 @@ class Tracker:
             unit = "段" if s.stage == "转写" else "批"
             parts.append(f"{s.stage} 第 {s.done}/{s.total} {unit}")
         parts.append(f"当前文件 {s.percent():.0f}%")
-        parts.append(f"已用 {fmt(time.time() - s.t0)}")
+        parts.append(f"{'总用时' if s.t_end else '已用'} {fmt((s.t_end or time.time()) - s.t0)}")
         e = s.eta()
         if s.state == "运行中":
             parts.append(f"本阶段剩余约 {fmt(e)}" if e is not None else "剩余时间：估算中…")
@@ -101,7 +101,7 @@ class App:
     def poll(s):
         while not s.q.empty():
             s.log.insert("end", s.q.get() + "\n"); s.log.see("end")
-        if s.tr:
+        if s.tr and not s.tr.t_end:
             s.pb["value"] = s.tr.percent(); s.status.set(s.tr.text())
         if s.th and not s.th.is_alive():
             s.th = None
@@ -109,6 +109,8 @@ class App:
             s.bt.config(state="disabled")
             if s.tr:
                 s.tr.state = "已停止" if s.stop.is_set() else "已完成"
+                s.tr.t_end = time.time()
+                if not s.stop.is_set(): s.pb["value"] = 100
                 s.status.set(s.tr.text())
             if s.preview_files: s.bo.config(state="normal")
         s.root.after(500, s.poll)
