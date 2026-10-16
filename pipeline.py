@@ -1,27 +1,11 @@
 #!/usr/bin/env python3
-"""日语视频 -> 中文字幕 本地流水线（转写: mlx-whisper；翻译: Gemini / PLaMo / Ollama）"""
+"""日语视频 -> 中文字幕 本地流水线（转写: mlx-whisper；翻译: PLaMo / Ollama，全部本地）"""
 import argparse, json, os, re, subprocess, sys, threading, time
 
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 CHUNK_SEC = 600
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:14b")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_MODELS = [m for m in os.environ.get("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview").split(",") if m]
-GEMINI_DEAD = set()  # 本次会话 404 / 当日额度用完的模型
-GEMINI_LAST = {}  # 模型 -> 上次请求时间（客户端限速）
-
-
-def _gemini_interval(m):
-    return 4.5 if "lite" in m else (2.5 if "gemma" in m else 13.0)
-
-
-def _gemini_wait(m):
-    d = GEMINI_LAST.get(m, 0) + _gemini_interval(m) - time.time()
-    if d > 0:
-        time.sleep(d)
-    GEMINI_LAST[m] = time.time()
-GEMINI_SAFETY = [{"category": c, "threshold": "BLOCK_NONE"} for c in ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT", "HARM_CATEGORY_CIVIC_INTEGRITY")]
 
 
 class FatalAPIError(RuntimeError):
@@ -161,53 +145,6 @@ SYS = ("你是专业的日译中字幕翻译。把日语字幕翻译成自然、
 
 def _chat(backend, messages):
     import requests
-    if backend == "gemini":
-        key = os.environ.get("GEMINI_API_KEY")
-        if not key:
-            raise FatalAPIError("未设置 GEMINI_API_KEY")
-        sys_t = "\n".join(m["content"] for m in messages if m["role"] == "system")
-        body = {"contents": [{"role": "user", "parts": [{"text": "\n".join(m["content"] for m in messages if m["role"] != "system")}]}],
-                "systemInstruction": {"parts": [{"text": sys_t}]}, "safetySettings": GEMINI_SAFETY,
-                "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}}
-        last = None
-        for wait in (0, 10, 30, 60, 120):
-            if wait:
-                print(f"[翻译] Gemini 全部繁忙，等 {wait}s 再试", flush=True); time.sleep(wait)
-            blocked = tried = 0
-            for m in GEMINI_MODELS:
-                if m in GEMINI_DEAD:
-                    continue
-                tried += 1
-                _gemini_wait(m)
-                try:
-                    r = requests.post(f"{GEMINI_URL}/{m}:generateContent", timeout=150,
-                                      headers={"x-goog-api-key": key}, json=body)
-                except requests.RequestException:
-                    last = f"{m} 网络超时"; print(f"[翻译] {last}，换模型", flush=True); continue
-                try:
-                    j = r.json()
-                except Exception:
-                    j = {}
-                err = (j.get("error") or {}).get("message", "")
-                if r.status_code == 401 or (r.status_code in (400, 403) and ("API key" in err or "API_KEY" in r.text)):
-                    raise FatalAPIError(f"Gemini {r.status_code}: Key 无效 {err[:150]}")
-                if r.status_code == 429 and ("PerDay" in r.text or "per day" in r.text.lower()):
-                    GEMINI_DEAD.add(m); print(f"[翻译] {m} 今日免费额度用完，本次跳过", flush=True); continue
-                if r.status_code == 404:
-                    GEMINI_DEAD.add(m); print(f"[翻译] {m} 不可用(404)，本次跳过", flush=True); continue
-                cand = (j.get("candidates") or [{}])[0]
-                txt = "".join(pt.get("text", "") for pt in (cand.get("content") or {}).get("parts", []) if not pt.get("thought"))
-                if r.status_code == 200 and txt:
-                    return txt
-                if r.status_code == 200:
-                    blocked += 1
-                    last = f"{m}: 被拦截/空回复 {cand.get('finishReason') or (j.get('promptFeedback') or {}).get('blockReason')}"
-                else:
-                    last = f"{m}: {r.status_code} {err[:80]}"
-                print(f"[翻译] {last}，换模型", flush=True)
-            if not tried or blocked == tried:
-                break  # 全部 404 或被内容拦截，等待无用
-        raise RuntimeError(last or "Gemini 失败")
     r = requests.post(OLLAMA_URL + "/api/chat", timeout=900,
                       json={"model": OLLAMA_MODEL, "messages": messages, "stream": False,
                             "think": False, "format": "json",
@@ -260,25 +197,17 @@ def _plamo_batch(batch, log, group=10):
     return res
 
 
-def _fallback(batch, ctx, log):
-    """Gemini 失败后：PLaMo 本地 → Ollama → 【未翻译】"""
-    try:
-        r = _plamo_batch(batch, log)
-        if not any(v.startswith("【未翻译】") for v in r.values()):
-            return r
-    except Exception as ex:
-        log(f"[翻译] PLaMo 失败: {ex}")
-    try:
-        log(f"[翻译] 第 {batch[0]['id']} 条改用本地 Ollama")
-        return _translate_batch("ollama", batch, ctx, log)
-    except Exception:
-        log(f"[翻译] 第 {batch[0]['id']} 条无法翻译，保留日文原文")
-        return {e["id"]: "【未翻译】" + e["text"].replace("\n", " ") for e in batch}
-
-
 def _translate_batch(backend, batch, ctx, log):
     if backend == "plamo":
-        return _plamo_batch(batch, log)
+        res = _plamo_batch(batch, log)
+        bad = [e for e in batch if res[e["id"]].startswith("【未翻译】")]
+        if bad:
+            log(f"[翻译] PLaMo 有 {len(bad)} 条失败，改用本地 Ollama")
+            try:
+                res.update(_translate_batch("ollama", bad, ctx, log))
+            except Exception as ex:
+                log(f"[翻译] Ollama 也失败: {ex}")
+        return res
     payload = {e["id"]: e["text"].replace("\n", " ") for e in batch}
     user = ""
     if ctx:
@@ -296,22 +225,17 @@ def _translate_batch(backend, batch, ctx, log):
         except FatalAPIError:
             raise
         except Exception as ex:
-            if backend == "gemini" and isinstance(ex, RuntimeError):
-                log(f"[翻译] Gemini 全部不可用（{ex}），改用本地 PLaMo")
-                return _fallback(batch, ctx, log)
             log(f"[翻译] 出错（第 {attempt+1} 次）: {ex}")
             time.sleep(2)
     if len(batch) > 1:  # 拆半重试
         h = len(batch) // 2
         a = _translate_batch(backend, batch[:h], ctx, log)
         return {**a, **_translate_batch(backend, batch[h:], batch[:h][-CONTEXT:], log)}
-    if backend == "gemini":
-        return _fallback(batch, ctx, log)
     log(f"[翻译] 第 {batch[0]['id']} 条无法翻译，保留日文原文")
     return {e["id"]: "【未翻译】" + e["text"].replace("\n", " ") for e in batch}
 
 
-def translate(video_or_srt, backend="gemini", log=print, stop=None, prog=None, ja=None, out=None):
+def translate(video_or_srt, backend="plamo", log=print, stop=None, prog=None, ja=None, out=None):
     if video_or_srt.endswith(".ja.srt"):
         ja = video_or_srt; b = ja[:-7]
         wd = os.path.join(os.path.dirname(b), ".subwork", os.path.basename(b)); os.makedirs(wd, exist_ok=True)
@@ -357,7 +281,7 @@ def preview_chunks(video):
     return max(1, math.ceil(duration(video) * 0.1 / CHUNK_SEC))
 
 
-def run(files, step="all", backend="gemini", log=print, stop=None, prog=None, preview=False):
+def run(files, step="all", backend="plamo", log=print, stop=None, prog=None, preview=False):
     """prog(file_i, n_files, stage, done, total, cached)"""
     results = []
     for k, f in enumerate(files, 1):
@@ -386,7 +310,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="日语视频→中文字幕")
     p.add_argument("files", nargs="+")
     p.add_argument("--step", choices=["all", "transcribe", "translate"], default="all")
-    p.add_argument("--backend", choices=["gemini", "plamo", "ollama"], default="gemini")
+    p.add_argument("--backend", choices=["plamo", "ollama"], default="plamo")
     p.add_argument("--preview", action="store_true", help="先试 10%")
     a = p.parse_args()
     run(a.files, a.step, a.backend, preview=a.preview)
